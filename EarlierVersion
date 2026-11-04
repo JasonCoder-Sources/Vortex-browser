@@ -1,0 +1,1242 @@
+
+import sys
+import os
+import json
+import base64
+import sqlite3
+import hashlib
+import secrets
+import time
+from urllib.parse import quote_plus
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTabWidget,
+    QLineEdit,
+    QPushButton,
+    QLabel,
+    QSplitter,
+    QTextEdit,
+    QMessageBox,
+    QDialog,
+    QInputDialog,
+    QFormLayout,
+    QDialogButtonBox,
+    QListWidget,
+    QListWidgetItem,
+)
+
+from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PySide6.QtWebEngineWidgets import QWebEngineView
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_NAME = "VORTEX"
+HOME_URL = "https://www.google.com"
+
+DATA_DIR = os.path.join(
+    os.path.expanduser("~"),
+    ".vortex_browser"
+)
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+HISTORY_DB = os.path.join(DATA_DIR, "history.db")
+VAULT_FILE = os.path.join(DATA_DIR, "passwords.vault")
+PROFILE_DIR = os.path.join(DATA_DIR, "profile")
+CACHE_DIR = os.path.join(DATA_DIR, "cache")
+
+os.makedirs(PROFILE_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Keep incognito windows alive independently of the main window.
+INCOGNITO_WINDOWS = []
+
+
+# ============================================================
+# ENCRYPTED PASSWORD VAULT
+# ============================================================
+
+class PasswordVault:
+
+    def __init__(self):
+        self.entries = []
+        self.fernet = None
+        self.salt = None
+
+    @staticmethod
+    def derive_key(password, salt):
+        key = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            600_000,
+            dklen=32
+        )
+
+        return base64.urlsafe_b64encode(key)
+
+    def unlock(self, parent):
+
+        # Existing vault
+        if os.path.exists(VAULT_FILE):
+
+            try:
+                with open(VAULT_FILE, "r", encoding="utf-8") as file:
+                    saved = json.load(file)
+
+                self.salt = base64.b64decode(saved["salt"])
+
+                password, ok = QInputDialog.getText(
+                    parent,
+                    "Unlock Password Vault",
+                    "Enter your master password:",
+                    QLineEdit.EchoMode.Password
+                )
+
+                if not ok or not password:
+                    return False
+
+                candidate = Fernet(
+                    self.derive_key(password, self.salt)
+                )
+
+                try:
+                    plaintext = candidate.decrypt(
+                        saved["data"].encode("ascii")
+                    )
+
+                    self.entries = json.loads(
+                        plaintext.decode("utf-8")
+                    )
+
+                except (InvalidToken, ValueError, json.JSONDecodeError):
+                    QMessageBox.warning(
+                        parent,
+                        "Incorrect Password",
+                        "The vault could not be unlocked. "
+                        "Check your master password."
+                    )
+                    return False
+
+                self.fernet = candidate
+                return True
+
+            except (OSError, KeyError, TypeError, ValueError):
+                QMessageBox.warning(
+                    parent,
+                    "Vault Error",
+                    "The password vault could not be read."
+                )
+                return False
+
+        # Create a new vault
+        password, ok = QInputDialog.getText(
+            parent,
+            "Create Password Vault",
+            "Create a strong master password (12+ characters):",
+            QLineEdit.EchoMode.Password
+        )
+
+        if not ok:
+            return False
+
+        if len(password) < 12:
+            QMessageBox.warning(
+                parent,
+                "Password Too Short",
+                "Use at least 12 characters."
+            )
+            return False
+
+        confirm, ok = QInputDialog.getText(
+            parent,
+            "Confirm Master Password",
+            "Enter your master password again:",
+            QLineEdit.EchoMode.Password
+        )
+
+        if not ok:
+            return False
+
+        if password != confirm:
+            QMessageBox.warning(
+                parent,
+                "Passwords Do Not Match",
+                "The passwords you entered do not match."
+            )
+            return False
+
+        self.salt = secrets.token_bytes(16)
+
+        self.fernet = Fernet(
+            self.derive_key(password, self.salt)
+        )
+
+        self.entries = []
+
+        if not self.save():
+            self.fernet = None
+
+            QMessageBox.warning(
+                parent,
+                "Save Failed",
+                "Could not create the password vault."
+            )
+
+            return False
+
+        return True
+
+    def save(self):
+
+        if self.fernet is None or self.salt is None:
+            return False
+
+        encrypted = self.fernet.encrypt(
+            json.dumps(self.entries).encode("utf-8")
+        )
+
+        payload = {
+            "salt": base64.b64encode(
+                self.salt
+            ).decode("ascii"),
+
+            "data": encrypted.decode("ascii")
+        }
+
+        temporary_file = VAULT_FILE + ".tmp"
+
+        try:
+            with open(
+                temporary_file, "w", encoding="utf-8"
+            ) as file:
+                json.dump(payload, file)
+
+            os.replace(temporary_file, VAULT_FILE)
+            return True
+
+        except OSError:
+            try:
+                if os.path.exists(temporary_file):
+                    os.remove(temporary_file)
+            except OSError:
+                pass
+
+            return False
+
+
+# ============================================================
+# BROWSER VIEW
+# ============================================================
+
+class BrowserView(QWebEngineView):
+
+    def __init__(self, profile, owner):
+        super().__init__()
+
+        self.owner = owner
+        self.setPage(QWebEnginePage(profile, self))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.owner.set_active(self)
+
+
+# ============================================================
+# BROWSER TAB AND SPLIT SCREEN
+# ============================================================
+
+class BrowserTab(QWidget):
+
+    def __init__(self, profile, window):
+        super().__init__()
+
+        self.window = window
+        self.profile = profile
+        self.secondary = None
+        self.active = None
+
+        self.splitter = QSplitter(
+            Qt.Orientation.Horizontal
+        )
+
+        self.primary = self.make_view()
+        self.splitter.addWidget(self.primary)
+
+        self.active = self.primary
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.splitter)
+
+    def make_view(self):
+
+        view = BrowserView(self.profile, self)
+
+        view.urlChanged.connect(
+            lambda url, v=view: self.url_changed(v, url)
+        )
+
+        view.titleChanged.connect(
+            lambda title, v=view: self.title_changed(v, title)
+        )
+
+        view.loadFinished.connect(
+            lambda ok, v=view: self.window.page_finished(v, ok)
+        )
+
+        return view
+
+    def set_active(self, view):
+
+        self.active = view
+
+        if self.window.tabs.currentWidget() is self:
+            self.window.address.setText(
+                view.url().toString()
+            )
+
+    def url_changed(self, view, url):
+
+        if (
+            self.window.tabs.currentWidget() is self
+            and self.active is view
+        ):
+            self.window.address.setText(url.toString())
+
+    def title_changed(self, view, title):
+
+        if view is self.primary:
+            self.window.update_tab_title(self, title)
+
+    def toggle_split(self):
+
+        if self.secondary:
+
+            old_view = self.secondary
+            self.secondary = None
+
+            old_view.setParent(None)
+            old_view.deleteLater()
+
+            self.active = self.primary
+            self.primary.setFocus()
+
+            self.window.address.setText(
+                self.primary.url().toString()
+            )
+
+        else:
+
+            self.secondary = self.make_view()
+
+            self.splitter.addWidget(self.secondary)
+            self.splitter.setSizes([650, 650])
+
+            self.secondary.setUrl(QUrl(HOME_URL))
+            self.secondary.setFocus()
+
+
+# ============================================================
+# MAIN BROWSER
+# ============================================================
+
+class VortexBrowser(QMainWindow):
+
+    def __init__(self, incognito=False):
+
+        super().__init__()
+
+        self.incognito = incognito
+        self.vault = PasswordVault()
+        self.vault_ready = False
+        self.history_db = None
+        self.incognito_window = None
+
+        mode = "Incognito" if incognito else "Normal"
+
+        self.setWindowTitle(f"VORTEX — {mode} Mode")
+        self.resize(1400, 900)
+        self.setMinimumSize(850, 600)
+
+        # ----------------------------------------------------
+        # Browser profiles
+        # ----------------------------------------------------
+
+        if incognito:
+
+            # No persistent storage path: off-the-record profile.
+            self.profile = QWebEngineProfile(self)
+
+            self.profile.setHttpCacheType(
+                QWebEngineProfile.HttpCacheType.NoCache
+            )
+
+            self.profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy
+                .NoPersistentCookies
+            )
+
+        else:
+
+            self.profile = QWebEngineProfile(
+                "VortexNormal", self
+            )
+
+            self.profile.setPersistentStoragePath(
+                PROFILE_DIR
+            )
+
+            self.profile.setCachePath(
+                CACHE_DIR
+            )
+
+            self.profile.setHttpCacheType(
+                QWebEngineProfile.HttpCacheType.DiskHttpCache
+            )
+
+            self.profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy
+                .AllowPersistentCookies
+            )
+
+            self.history_db = sqlite3.connect(HISTORY_DB)
+
+            self.history_db.execute("""
+                CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    title TEXT,
+                    visited REAL NOT NULL
+                )
+            """)
+
+            self.history_db.commit()
+
+        # ----------------------------------------------------
+        # Main layout
+        # ----------------------------------------------------
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header
+        header = QHBoxLayout()
+        header.setContentsMargins(16, 12, 16, 12)
+
+        logo = QLabel("VORTEX")
+        logo.setObjectName("logo")
+
+        self.mode_label = QLabel(
+            "INCOGNITO SESSION"
+            if incognito
+            else "PRIVATE BROWSING CONTROLS"
+        )
+
+        self.mode_label.setObjectName("tagline")
+
+        header.addWidget(logo)
+        header.addWidget(self.mode_label)
+        header.addStretch()
+
+        self.split_button = self.button("◫ Split", True)
+        self.split_button.clicked.connect(self.toggle_split)
+        header.addWidget(self.split_button)
+
+        if not incognito:
+
+            history_button = self.button("History")
+            history_button.clicked.connect(self.show_history)
+            header.addWidget(history_button)
+
+            password_button = self.button("Passwords")
+            password_button.clicked.connect(self.show_passwords)
+            header.addWidget(password_button)
+
+        self.incognito_button = self.button(
+            "Exit Incognito" if incognito else "Incognito"
+        )
+
+        self.incognito_button.clicked.connect(
+            self.open_incognito
+        )
+
+        header.addWidget(self.incognito_button)
+        layout.addLayout(header)
+
+        # Navigation bar
+        nav = QHBoxLayout()
+        nav.setContentsMargins(12, 6, 12, 10)
+        nav.setSpacing(7)
+
+        back = self.button("←")
+        forward = self.button("→")
+        reload_button = self.button("↻")
+        home = self.button("⌂")
+        new_tab_button = self.button("+", True)
+
+        back.clicked.connect(
+            lambda: self.current_view().back()
+        )
+
+        forward.clicked.connect(
+            lambda: self.current_view().forward()
+        )
+
+        reload_button.clicked.connect(
+            lambda: self.current_view().reload()
+        )
+
+        home.clicked.connect(
+            lambda: self.current_view().setUrl(QUrl(HOME_URL))
+        )
+
+        new_tab_button.clicked.connect(self.new_tab)
+
+        self.address = QLineEdit()
+        self.address.setPlaceholderText(
+            "Search Google or enter a website..."
+        )
+        self.address.setClearButtonEnabled(True)
+        self.address.returnPressed.connect(self.navigate)
+
+        for widget in (
+            back, forward, reload_button, home
+        ):
+            nav.addWidget(widget)
+
+        nav.addWidget(self.address, 1)
+        nav.addWidget(new_tab_button)
+        layout.addLayout(nav)
+
+        # Tabs
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(True)
+        self.tabs.setTabsClosable(True)
+
+        self.tabs.currentChanged.connect(
+            self.update_address
+        )
+
+        self.tabs.tabCloseRequested.connect(
+            self.close_tab
+        )
+
+        layout.addWidget(self.tabs, 1)
+
+        # Temporary notes
+        self.notes = QTextEdit()
+        self.notes.setPlaceholderText(
+            "Temporary quick notes for this session..."
+        )
+        self.notes.setMaximumHeight(95)
+        self.notes.hide()
+
+        layout.addWidget(self.notes)
+
+        # Footer
+        footer = QHBoxLayout()
+        footer.setContentsMargins(14, 7, 14, 7)
+
+        status_text = (
+            "INCOGNITO • NORMAL HISTORY DISABLED"
+            if incognito
+            else "NORMAL MODE • HISTORY ENABLED"
+        )
+
+        self.status = QLabel(status_text)
+        self.status.setObjectName("status")
+
+        footer.addWidget(self.status)
+        footer.addStretch()
+
+        notes_button = self.button("Quick Notes")
+
+        notes_button.clicked.connect(
+            self.toggle_notes
+        )
+
+        footer.addWidget(notes_button)
+        layout.addLayout(footer)
+
+        # Keyboard shortcuts
+        QShortcut(
+            QKeySequence("Ctrl+L"),
+            self,
+            activated=self.focus_address
+        )
+
+        QShortcut(
+            QKeySequence("Ctrl+T"),
+            self,
+            activated=self.new_tab
+        )
+
+        QShortcut(
+            QKeySequence("Ctrl+W"),
+            self,
+            activated=self.close_current_tab
+        )
+
+        QShortcut(
+            QKeySequence("Ctrl+R"),
+            self,
+            activated=lambda: self.current_view().reload()
+        )
+
+        QShortcut(
+            QKeySequence("Ctrl+Shift+S"),
+            self,
+            activated=self.toggle_split
+        )
+
+        QShortcut(
+            QKeySequence("Ctrl+Shift+N"),
+            self,
+            activated=self.open_incognito
+        )
+
+        self.apply_theme()
+        self.new_tab()
+
+    # ========================================================
+    # STYLING
+    # ========================================================
+
+    def button(self, text, accent=False):
+
+        btn = QPushButton(text)
+        btn.setObjectName(
+            "accent" if accent else "toolButton"
+        )
+        btn.setMinimumHeight(36)
+
+        return btn
+
+    def apply_theme(self):
+
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background: #101010;
+                color: #eeeeee;
+                font-family: "Segoe UI";
+                font-size: 13px;
+            }
+
+            QLabel#logo {
+                color: #ff3030;
+                font-size: 26px;
+                font-weight: 900;
+                letter-spacing: 3px;
+            }
+
+            QLabel#tagline {
+                color: #ff5555;
+                font-size: 10px;
+                padding-left: 8px;
+            }
+
+            QLineEdit, QTextEdit {
+                background: #191919;
+                color: white;
+                border: 1px solid #333333;
+                border-radius: 8px;
+                padding: 9px;
+                selection-background-color: #ff3030;
+            }
+
+            QLineEdit:focus, QTextEdit:focus {
+                border: 1px solid #ff3030;
+            }
+
+            QPushButton {
+                border: none;
+                border-radius: 7px;
+                padding: 8px 12px;
+                font-weight: bold;
+            }
+
+            QPushButton#toolButton {
+                background: #202020;
+                color: #eeeeee;
+            }
+
+            QPushButton#toolButton:hover {
+                background: #333333;
+            }
+
+            QPushButton#accent {
+                background: #ff3030;
+                color: white;
+            }
+
+            QPushButton#accent:hover {
+                background: #d82020;
+            }
+
+            QTabWidget::pane {
+                border: none;
+                background: #101010;
+            }
+
+            QTabBar::tab {
+                background: #191919;
+                color: #999999;
+                padding: 11px 15px;
+                border-bottom: 2px solid #191919;
+                min-width: 85px;
+            }
+
+            QTabBar::tab:selected {
+                background: #252525;
+                color: white;
+                border-bottom: 2px solid #ff3030;
+            }
+
+            QSplitter::handle {
+                background: #ff3030;
+                width: 3px;
+            }
+
+            QLabel#status {
+                color: #ff5555;
+                font-size: 10px;
+                font-weight: bold;
+            }
+
+            QDialog, QListWidget {
+                background: #151515;
+                color: white;
+            }
+
+            QListWidget::item:selected {
+                background: #612020;
+            }
+        """)
+
+    # ========================================================
+    # TABS
+    # ========================================================
+
+    def current_tab(self):
+
+        tab = self.tabs.currentWidget()
+
+        if tab is None:
+            self.new_tab()
+            tab = self.tabs.currentWidget()
+
+        return tab
+
+    def current_view(self):
+        return self.current_tab().active
+
+    def new_tab(self):
+
+        tab = BrowserTab(self.profile, self)
+
+        index = self.tabs.addTab(tab, "New Tab")
+        self.tabs.setCurrentIndex(index)
+
+        tab.primary.setUrl(QUrl(HOME_URL))
+        tab.primary.setFocus()
+
+        self.split_button.setText("◫ Split")
+
+    def update_tab_title(self, tab, title):
+
+        index = self.tabs.indexOf(tab)
+
+        if index >= 0:
+            self.tabs.setTabText(
+                index, (title or "New Tab")[:22]
+            )
+
+    def update_address(self, index):
+
+        tab = self.tabs.widget(index)
+
+        if tab:
+            self.address.setText(
+                tab.active.url().toString()
+            )
+
+            self.split_button.setText(
+                "◫ Close Split"
+                if tab.secondary
+                else "◫ Split"
+            )
+
+    def close_current_tab(self):
+        self.close_tab(self.tabs.currentIndex())
+
+    def close_tab(self, index):
+
+        if index < 0:
+            return
+
+        tab = self.tabs.widget(index)
+
+        if tab is None:
+            return
+
+        if self.tabs.count() <= 1:
+
+            tab.primary.setUrl(QUrl(HOME_URL))
+
+            if tab.secondary:
+                tab.toggle_split()
+
+            return
+
+        self.tabs.removeTab(index)
+        tab.deleteLater()
+
+    # ========================================================
+    # NAVIGATION AND GOOGLE SEARCH
+    # ========================================================
+
+    def navigate(self):
+
+        text = self.address.text().strip()
+
+        if not text:
+            return
+
+        if " " in text or "." not in text:
+
+            url = QUrl(
+                "https://www.google.com/search?q="
+                + quote_plus(text)
+            )
+
+        else:
+
+            if not text.startswith(
+                ("http://", "https://")
+            ):
+                text = "https://" + text
+
+            url = QUrl.fromUserInput(text)
+
+        self.current_view().setUrl(url)
+
+    def focus_address(self):
+
+        self.address.setFocus()
+        self.address.selectAll()
+
+    # ========================================================
+    # SPLIT SCREEN
+    # ========================================================
+
+    def toggle_split(self):
+
+        tab = self.current_tab()
+        tab.toggle_split()
+
+        self.split_button.setText(
+            "◫ Close Split"
+            if tab.secondary
+            else "◫ Split"
+        )
+
+    # ========================================================
+    # BROWSING HISTORY
+    # ========================================================
+
+    def page_finished(self, view, ok):
+
+        if ok and not self.incognito:
+            url = view.url().toString()
+
+            if url.startswith(("http://", "https://")):
+                self.record_history(
+                    url, view.title() or url
+                )
+
+        mode = "INCOGNITO" if self.incognito else "NORMAL MODE"
+
+        self.status.setText(
+            mode + (" • PAGE READY" if ok else " • PAGE FAILED")
+        )
+
+    def record_history(self, url, title):
+
+        if self.incognito or not self.history_db:
+            return
+
+        if not url.startswith(("http://", "https://")):
+            return
+
+        try:
+            self.history_db.execute(
+                """
+                INSERT INTO history (url, title, visited)
+                VALUES (?, ?, ?)
+                """,
+                (url, title or url, time.time())
+            )
+
+            self.history_db.commit()
+
+        except sqlite3.Error:
+            pass
+
+    def show_history(self):
+
+        if self.incognito or not self.history_db:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Vortex — Browsing History")
+        dialog.resize(800, 500)
+
+        layout = QVBoxLayout(dialog)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Filter history...")
+        layout.addWidget(search)
+
+        listing = QListWidget()
+        layout.addWidget(listing)
+
+        def refresh():
+
+            listing.clear()
+
+            rows = self.history_db.execute(
+                """
+                SELECT url, title, visited
+                FROM history
+                ORDER BY visited DESC
+                LIMIT 2000
+                """
+            ).fetchall()
+
+            term = search.text().lower()
+
+            for url, title, visited in rows:
+
+                label = f"{title or url} — {url}"
+
+                if term in label.lower():
+
+                    item = QListWidgetItem(label)
+
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        url
+                    )
+
+                    listing.addItem(item)
+
+        def open_item(item):
+
+            self.current_view().setUrl(
+                QUrl(item.data(Qt.ItemDataRole.UserRole))
+            )
+
+            dialog.accept()
+
+        def clear_history():
+
+            answer = QMessageBox.question(
+                dialog,
+                "Clear History",
+                "Delete all saved browsing history?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+            )
+
+            if answer == QMessageBox.StandardButton.Yes:
+
+                self.history_db.execute(
+                    "DELETE FROM history"
+                )
+
+                self.history_db.commit()
+                refresh()
+
+        search.textChanged.connect(refresh)
+        listing.itemDoubleClicked.connect(open_item)
+
+        clear_button = QPushButton("Clear History")
+        clear_button.clicked.connect(clear_history)
+
+        layout.addWidget(clear_button)
+
+        refresh()
+        dialog.exec()
+
+    # ========================================================
+    # PASSWORD MANAGER
+    # ========================================================
+
+    def show_passwords(self):
+
+        if self.incognito:
+            return
+
+        if not self.vault_ready:
+
+            if not self.vault.unlock(self):
+                return
+
+            self.vault_ready = True
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Vortex — Password Vault")
+        dialog.resize(650, 430)
+
+        layout = QVBoxLayout(dialog)
+
+        listing = QListWidget()
+        layout.addWidget(listing)
+
+        def refresh():
+
+            listing.clear()
+
+            for entry in self.vault.entries:
+
+                item = QListWidgetItem(
+                    f"{entry['site']} | {entry['username']}"
+                )
+
+                listing.addItem(item)
+
+        def add_password():
+
+            form = QDialog(dialog)
+            form.setWindowTitle("Save Password")
+
+            fields = QFormLayout(form)
+
+            site = QLineEdit(
+                self.current_view().url().host()
+            )
+
+            username = QLineEdit()
+
+            password = QLineEdit()
+            password.setEchoMode(
+                QLineEdit.EchoMode.Password
+            )
+
+            fields.addRow("Website:", site)
+            fields.addRow("Username:", username)
+            fields.addRow("Password:", password)
+
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Save
+                | QDialogButtonBox.StandardButton.Cancel
+            )
+
+            buttons.accepted.connect(form.accept)
+            buttons.rejected.connect(form.reject)
+
+            fields.addRow(buttons)
+
+            if form.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            if not site.text().strip() or not password.text():
+
+                QMessageBox.warning(
+                    dialog,
+                    "Missing Details",
+                    "Website and password are required."
+                )
+
+                return
+
+            entry = {
+                "site": site.text().strip(),
+                "username": username.text(),
+                "password": password.text()
+            }
+
+            self.vault.entries.append(entry)
+
+            if self.vault.save():
+                refresh()
+
+            else:
+
+                self.vault.entries.pop()
+
+                QMessageBox.warning(
+                    dialog,
+                    "Save Failed",
+                    "Could not save the encrypted vault."
+                )
+
+        def copy_password():
+
+            row = listing.currentRow()
+
+            if row < 0:
+                return
+
+            answer = QMessageBox.question(
+                dialog,
+                "Copy Password",
+                "Copy this password to the clipboard? "
+                "Other applications may be able to read "
+                "clipboard contents.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+            )
+
+            if answer == QMessageBox.StandardButton.Yes:
+
+                QApplication.clipboard().setText(
+                    self.vault.entries[row]["password"]
+                )
+
+        def delete_password():
+
+            row = listing.currentRow()
+
+            if row < 0:
+                return
+
+            answer = QMessageBox.question(
+                dialog,
+                "Delete Password",
+                "Delete this saved login?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            removed = self.vault.entries.pop(row)
+
+            if not self.vault.save():
+
+                self.vault.entries.insert(row, removed)
+
+                QMessageBox.warning(
+                    dialog,
+                    "Delete Failed",
+                    "Could not update the vault."
+                )
+
+            refresh()
+
+        buttons = QHBoxLayout()
+
+        add_button = QPushButton("Add Password")
+        copy_button = QPushButton("Copy Password")
+        delete_button = QPushButton("Delete")
+
+        add_button.clicked.connect(add_password)
+        copy_button.clicked.connect(copy_password)
+        delete_button.clicked.connect(delete_password)
+
+        buttons.addWidget(add_button)
+        buttons.addWidget(copy_button)
+        buttons.addWidget(delete_button)
+
+        layout.addLayout(buttons)
+
+        refresh()
+        dialog.exec()
+
+    # ========================================================
+    # INCOGNITO MODE
+    # ========================================================
+
+    def open_incognito(self):
+
+        if self.incognito:
+
+            self.close()
+            return
+
+        window = VortexBrowser(incognito=True)
+
+        # Keep a reference so Python doesn't destroy the window.
+        INCOGNITO_WINDOWS.append(window)
+
+        window.setAttribute(
+            Qt.WidgetAttribute.WA_DeleteOnClose,
+            True
+        )
+
+        window.destroyed.connect(
+            lambda: INCOGNITO_WINDOWS.remove(window)
+            if window in INCOGNITO_WINDOWS else None
+        )
+
+        window.show()
+
+    # ========================================================
+    # QUICK NOTES
+    # ========================================================
+
+    def toggle_notes(self):
+
+        self.notes.setVisible(
+            not self.notes.isVisible()
+        )
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    def closeEvent(self, event):
+
+        # Notes are never written to a file.
+        self.notes.clear()
+
+        # Close database connection.
+        if self.history_db:
+
+            self.history_db.close()
+            self.history_db = None
+
+        # Clear in-memory browser caches and visited links.
+        self.profile.clearHttpCache()
+        self.profile.clearAllVisitedLinks()
+
+        # Delete tabs and their pages.
+        self.tabs.clear()
+
+        event.accept()
+
+
+# ============================================================
+# START APPLICATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+
+    browser = VortexBrowser()
+    browser.show()
+
+    sys.exit(app.exec())
