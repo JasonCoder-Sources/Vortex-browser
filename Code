@@ -1,0 +1,1734 @@
+
+# ============================================================
+# VORTEX BROWSER
+# ============================================================
+# Python + PySide6 + Qt WebEngine
+#
+# Install:
+#   python -m pip install PySide6 PySide6-Addons cryptography
+#
+# Layout:
+#   - Tabs at the top
+#   - + button beside tabs
+#   - Address bar underneath
+#   - Browser content underneath the address bar
+#
+# Features:
+#   - Choose any two existing tabs for split view
+#   - Switch split-view tabs without losing their pages
+#   - New-window and target="_blank" navigation
+#   - JavaScript window.open support
+#   - Bookmarks and history
+#   - Downloads
+#   - Find in page
+#   - Zoom controls
+#   - Dark/light themes
+#   - Quick notes
+#   - Incognito window
+#   - Session restoration
+#   - Three-dot menu
+#   - Keyboard shortcuts
+# ============================================================
+
+import os
+import sys
+import json
+import time
+import re
+import html
+from urllib.parse import quote_plus
+
+from PySide6.QtCore import Qt, QUrl, QStandardPaths, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QToolButton,
+    QPushButton,
+    QTabBar,
+    QStackedWidget,
+    QMenu,
+    QMessageBox,
+    QDialog,
+    QLabel,
+    QTextEdit,
+    QPlainTextEdit,
+    QFormLayout,
+    QDialogButtonBox,
+    QInputDialog,
+    QFileDialog,
+    QSplitter,
+    QProgressBar,
+    QStatusBar,
+    QComboBox,
+    QCheckBox,
+    QListWidget,
+    QFrame,
+)
+
+from PySide6.QtWebEngineCore import (
+    QWebEngineProfile,
+    QWebEnginePage,
+    QWebEngineSettings,
+)
+
+from PySide6.QtWebEngineWidgets import QWebEngineView
+
+
+# ============================================================
+# PATHS AND DATA
+# ============================================================
+
+APP_DATA = QStandardPaths.writableLocation(
+    QStandardPaths.StandardLocation.AppDataLocation
+)
+
+if not APP_DATA:
+    APP_DATA = os.path.join(os.path.expanduser("~"), ".vortex_browser")
+
+os.makedirs(APP_DATA, exist_ok=True)
+
+PROFILE_DIR = os.path.join(APP_DATA, "profile")
+CACHE_DIR = os.path.join(APP_DATA, "cache")
+DOWNLOAD_DIR = os.path.join(
+    QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.DownloadLocation
+    ) or os.path.expanduser("~"),
+    "VORTEX",
+)
+
+for folder in (PROFILE_DIR, CACHE_DIR, DOWNLOAD_DIR):
+    os.makedirs(folder, exist_ok=True)
+
+SETTINGS_FILE = os.path.join(APP_DATA, "settings.json")
+BOOKMARKS_FILE = os.path.join(APP_DATA, "bookmarks.json")
+HISTORY_FILE = os.path.join(APP_DATA, "history.json")
+SESSION_FILE = os.path.join(APP_DATA, "session.json")
+NOTES_FILE = os.path.join(APP_DATA, "notes.txt")
+
+DEFAULT_SETTINGS = {
+    "theme": "dark",
+    "search_engine": "Google",
+    "home_page": "vortex",
+    "custom_home": "https://www.google.com",
+    "restore_session": True,
+    "zoom": 100,
+}
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, data):
+    try:
+        temp = path + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(temp, path)
+    except OSError as error:
+        print("VORTEX save error:", error)
+
+
+def normalize_url(text, search_engine="Google"):
+    text = text.strip()
+
+    if not text:
+        return QUrl("about:blank")
+
+    if text.startswith(("about:", "file:", "data:")):
+        return QUrl(text)
+
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        return QUrl(text)
+
+    if " " not in text:
+        first_part = text.split("/")[0]
+        if "." in first_part or first_part.startswith("localhost"):
+            if first_part.startswith("localhost"):
+                return QUrl("http://" + text)
+            return QUrl("https://" + text)
+
+    engines = {
+        "Google": "https://www.google.com/search?q=",
+        "Bing": "https://www.bing.com/search?q=",
+        "DuckDuckGo": "https://duckduckgo.com/?q=",
+        "Brave": "https://search.brave.com/search?q=",
+    }
+
+    base = engines.get(search_engine, engines["Google"])
+    return QUrl(base + quote_plus(text))
+
+
+# ============================================================
+# THEMES
+# ============================================================
+
+DARK_STYLE = """
+QMainWindow, QWidget {
+    background-color: #17191f;
+    color: #e8eaf0;
+    font-family: Segoe UI, Arial;
+    font-size: 10pt;
+}
+QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QComboBox {
+    background-color: #22252d;
+    color: #f0f1f5;
+    border: 1px solid #393d49;
+    border-radius: 7px;
+    padding: 6px;
+}
+QLineEdit:focus { border: 1px solid #7691ff; }
+QToolButton, QPushButton {
+    background-color: #252832;
+    color: #f0f1f5;
+    border: 1px solid #373b47;
+    border-radius: 7px;
+    padding: 6px 9px;
+}
+QToolButton:hover, QPushButton:hover { background-color: #343947; }
+QTabBar::tab {
+    background-color: #20232b;
+    color: #bfc4d2;
+    border: none;
+    padding: 8px 13px;
+    margin-right: 3px;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    min-width: 65px;
+}
+QTabBar::tab:selected { background-color: #303440; color: white; }
+QTabBar::tab:hover { background-color: #292d37; }
+QMenu {
+    background-color: #242731;
+    color: #f1f2f7;
+    border: 1px solid #414654;
+    padding: 5px;
+}
+QMenu::item { padding: 7px 28px 7px 12px; }
+QMenu::item:selected { background-color: #414b67; }
+QProgressBar { background-color: #22252d; border: none; max-height: 3px; }
+QProgressBar::chunk { background-color: #7691ff; }
+QStatusBar { background-color: #17191f; color: #aeb4c4; }
+"""
+
+LIGHT_STYLE = """
+QMainWindow, QWidget {
+    background-color: #f4f6fa;
+    color: #202430;
+    font-family: Segoe UI, Arial;
+    font-size: 10pt;
+}
+QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QComboBox {
+    background-color: white;
+    color: #202430;
+    border: 1px solid #d6dae4;
+    border-radius: 7px;
+    padding: 6px;
+}
+QLineEdit:focus { border: 1px solid #6884ef; }
+QToolButton, QPushButton {
+    background-color: white;
+    color: #202430;
+    border: 1px solid #d8dce5;
+    border-radius: 7px;
+    padding: 6px 9px;
+}
+QToolButton:hover, QPushButton:hover { background-color: #e9edf5; }
+QTabBar::tab {
+    background-color: #e7eaf1;
+    color: #555d6d;
+    border: none;
+    padding: 8px 13px;
+    margin-right: 3px;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    min-width: 65px;
+}
+QTabBar::tab:selected { background-color: white; color: #202430; }
+QMenu {
+    background-color: white;
+    color: #202430;
+    border: 1px solid #d6dae4;
+    padding: 5px;
+}
+QMenu::item { padding: 7px 28px 7px 12px; }
+QMenu::item:selected { background-color: #e4eafc; }
+QProgressBar { background-color: #e0e4ec; border: none; max-height: 3px; }
+QProgressBar::chunk { background-color: #4969df; }
+QStatusBar { background-color: #f4f6fa; color: #656d7e; }
+"""
+
+
+# ============================================================
+# HOME PAGE
+# ============================================================
+
+def home_html(theme="dark"):
+    dark = theme == "dark"
+    bg = "#17191f" if dark else "#f4f6fa"
+    fg = "#f0f1f5" if dark else "#202430"
+    secondary = "#aeb5c6" if dark else "#687084"
+    card = "#22252d" if dark else "#ffffff"
+    border = "#393d49" if dark else "#d6dae4"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+        margin: 0; min-height: 100vh; background: {bg}; color: {fg};
+        font-family: Segoe UI, Arial, sans-serif;
+        display: flex; align-items: center; justify-content: center;
+    }}
+    .container {{ width: min(760px, 90%); text-align: center; padding: 30px 0 70px; }}
+    .logo {{ font-size: 52px; font-weight: 800; letter-spacing: 5px; margin-bottom: 7px; }}
+    .subtitle {{ color: {secondary}; margin-bottom: 34px; }}
+    form {{ display: flex; gap: 8px; margin-bottom: 28px; }}
+    input {{
+        min-width: 0; flex: 1; padding: 15px 17px; border-radius: 12px;
+        border: 1px solid {border}; background: {card}; color: {fg}; font-size: 16px;
+    }}
+    button {{
+        padding: 0 22px; border: none; border-radius: 12px;
+        background: #617df0; color: white; font-size: 15px; cursor: pointer;
+    }}
+    .grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; text-align: left; }}
+    a {{
+        display: block; background: {card}; border: 1px solid {border};
+        border-radius: 12px; padding: 17px; text-decoration: none; color: {fg};
+    }}
+    a:hover {{ border-color: #617df0; }}
+    .hint {{ margin-top: 30px; color: {secondary}; font-size: 12px; }}
+    @media(max-width: 500px) {{
+        .grid {{ grid-template-columns: repeat(2, 1fr); }}
+        .logo {{ font-size: 38px; }}
+    }}
+    </style>
+    </head>
+    <body>
+    <div class="container">
+        <div class="logo">VORTEX</div>
+        <div class="subtitle">Your browser. Your space.</div>
+        <form id="searchForm">
+            <input id="query" autofocus placeholder="Search the web or enter a URL">
+            <button type="submit">Search</button>
+        </form>
+        <div class="grid">
+            <a href="https://www.google.com"><b>Google</b><br>Search the web</a>
+            <a href="https://www.youtube.com"><b>YouTube</b><br>Videos and music</a>
+            <a href="https://www.wikipedia.org"><b>Wikipedia</b><br>Explore knowledge</a>
+            <a href="https://www.github.com"><b>GitHub</b><br>Build something</a>
+            <a href="https://www.reddit.com"><b>Reddit</b><br>Explore communities</a>
+            <a href="https://www.canva.com"><b>Canva</b><br>Create designs</a>
+        </div>
+        <div class="hint">Ctrl+L to search · Ctrl+T for a new tab · Ctrl+F to find</div>
+    </div>
+    <script>
+    document.getElementById('searchForm').addEventListener('submit', function(e) {{
+        e.preventDefault();
+        const q = document.getElementById('query').value.trim();
+        if (!q) return;
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\\/\\//.test(q)) {{
+            window.location.href = q;
+        }} else if (!q.includes(' ') && /^[\\w.-]+\\.[a-zA-Z]{{2,}}/.test(q)) {{
+            window.location.href = 'https://' + q;
+        }} else {{
+            window.location.href = 'https://www.google.com/search?q=' + encodeURIComponent(q);
+        }}
+    }});
+    </script>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# WEB PAGE: HANDLE NEW WINDOWS AND TABS
+# ============================================================
+
+class VortexPage(QWebEnginePage):
+    """
+    Pages created by target=_blank and window.open are routed
+    through the browser's tab-creation callback.
+
+    This is particularly useful for web apps that open projects,
+    documents or other content in a new tab.
+    """
+
+    def __init__(self, profile, browser, parent=None):
+        super().__init__(profile, parent)
+        self.browser = browser
+
+    def createWindow(self, window_type):
+        if self.browser is None:
+            return None
+
+        return self.browser.create_popup_page(window_type)
+
+
+# ============================================================
+# SPLIT VIEW SELECTOR
+# ============================================================
+
+class SplitViewDialog(QDialog):
+
+    def __init__(self, tabs, current_index=0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose split-view tabs")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Choose two different tabs to display side by side."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.left_combo = QComboBox()
+        self.right_combo = QComboBox()
+
+        for index, title, url in tabs:
+            label = f"{title}  —  {url[:65]}"
+            self.left_combo.addItem(label, index)
+            self.right_combo.addItem(label, index)
+
+        left_position = self.left_combo.findData(current_index)
+        if left_position >= 0:
+            self.left_combo.setCurrentIndex(left_position)
+
+        right_position = 1 if self.right_combo.count() > 1 else 0
+        self.right_combo.setCurrentIndex(right_position)
+
+        form.addRow("Left tab:", self.left_combo)
+        form.addRow("Right tab:", self.right_combo)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_indices(self):
+        return (
+            self.left_combo.currentData(),
+            self.right_combo.currentData(),
+        )
+
+
+# ============================================================
+# MAIN BROWSER
+# ============================================================
+
+class VortexBrowser(QMainWindow):
+
+    def __init__(self, incognito=False):
+        super().__init__()
+
+        self.incognito = incognito
+        self.settings_data = load_json(
+            SETTINGS_FILE,
+            DEFAULT_SETTINGS.copy(),
+        )
+
+        for key, value in DEFAULT_SETTINGS.items():
+            self.settings_data.setdefault(key, value)
+
+        self.bookmarks = (
+            [] if incognito else load_json(BOOKMARKS_FILE, [])
+        )
+        self.history = (
+            [] if incognito else load_json(HISTORY_FILE, [])
+        )
+
+        self.views = []
+        self.view_titles = {}
+        self.view_urls = {}
+        self.zoom_levels = {}
+        self.pending_popups = []
+        self.split_active = False
+        self.split_left_view = None
+        self.split_right_view = None
+        self.splitter = None
+
+        self.setWindowTitle(
+            "VORTEX — Incognito" if incognito else "VORTEX Browser"
+        )
+        self.resize(1360, 850)
+        self.setMinimumSize(760, 500)
+
+        self._create_profile()
+        self._build_interface()
+        self._setup_shortcuts()
+        self.apply_theme()
+
+        self.profile.downloadRequested.connect(self.handle_download)
+
+        if not incognito and self.settings_data.get("restore_session", True):
+            session = load_json(SESSION_FILE, {})
+            urls = session.get("tabs", [])
+
+            if urls:
+                for url in urls:
+                    self.new_tab(url=url, switch=False)
+                index = min(
+                    session.get("current", 0),
+                    max(0, len(self.views) - 1),
+                )
+                if self.views:
+                    self.switch_tab(index)
+            else:
+                self.new_tab()
+        else:
+            self.new_tab()
+
+    # --------------------------------------------------------
+    # PROFILE
+    # --------------------------------------------------------
+
+    def _create_profile(self):
+        if self.incognito:
+            self.profile = QWebEngineProfile(self)
+            self.profile.setHttpCacheType(
+                QWebEngineProfile.HttpCacheType.MemoryHttpCache
+            )
+            self.profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies
+            )
+        else:
+            self.profile = QWebEngineProfile("VortexProfile", self)
+            self.profile.setPersistentStoragePath(PROFILE_DIR)
+            self.profile.setCachePath(CACHE_DIR)
+            self.profile.setHttpCacheType(
+                QWebEngineProfile.HttpCacheType.DiskHttpCache
+            )
+            self.profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies
+            )
+
+    # --------------------------------------------------------
+    # INTERFACE
+    # --------------------------------------------------------
+
+    def _build_interface(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(5, 5, 5, 0)
+        main_layout.setSpacing(3)
+
+        # Tab strip is the topmost browser row.
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(3)
+
+        self.tab_bar = QTabBar()
+        self.tab_bar.setMovable(True)
+        self.tab_bar.setTabsClosable(True)
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setDocumentMode(True)
+        self.tab_bar.currentChanged.connect(self.switch_tab)
+        self.tab_bar.tabCloseRequested.connect(self.close_tab)
+        self.tab_bar.tabMoved.connect(self._on_tab_moved)
+
+        tab_row.addWidget(self.tab_bar, 1)
+
+        self.add_tab_button = QToolButton()
+        self.add_tab_button.setText("+")
+        self.add_tab_button.setToolTip("New tab (Ctrl+T)")
+        self.add_tab_button.setFixedSize(32, 31)
+        self.add_tab_button.setStyleSheet(
+            "QToolButton { font-size: 18px; font-weight: bold; }"
+        )
+        self.add_tab_button.clicked.connect(self.new_tab)
+        tab_row.addWidget(self.add_tab_button)
+
+        main_layout.addLayout(tab_row)
+
+        # Address/navigation bar directly below the tabs.
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(4)
+
+        self.back_button = self._tool_button("←", "Back")
+        self.forward_button = self._tool_button("→", "Forward")
+        self.reload_button = self._tool_button("↻", "Reload")
+        self.home_button = self._tool_button("⌂", "Home")
+
+        self.back_button.clicked.connect(self.go_back)
+        self.forward_button.clicked.connect(self.go_forward)
+        self.reload_button.clicked.connect(self.reload_page)
+        self.home_button.clicked.connect(self.go_home)
+
+        nav_row.addWidget(self.back_button)
+        nav_row.addWidget(self.forward_button)
+        nav_row.addWidget(self.reload_button)
+        nav_row.addWidget(self.home_button)
+
+        self.address_bar = QLineEdit()
+        self.address_bar.setPlaceholderText("Search or enter address")
+        self.address_bar.setClearButtonEnabled(True)
+        self.address_bar.returnPressed.connect(self.navigate)
+        self.address_bar.setMinimumHeight(34)
+        nav_row.addWidget(self.address_bar, 1)
+
+        self.bookmark_button = self._tool_button("☆", "Bookmark this page")
+        self.bookmark_button.clicked.connect(self.add_bookmark)
+        nav_row.addWidget(self.bookmark_button)
+
+        self.menu_button = self._tool_button("⋮", "Browser menu")
+        self.menu_button.setFixedWidth(34)
+        self.menu_button.clicked.connect(self.show_browser_menu)
+        nav_row.addWidget(self.menu_button)
+
+        main_layout.addLayout(nav_row)
+
+        # The progress bar replaces noisy "Page ready" text.
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(3)
+        self.progress_bar.hide()
+        main_layout.addWidget(self.progress_bar)
+
+        # Main content: normal tab stack or two-way split.
+        self.content_stack = QStackedWidget()
+        main_layout.addWidget(self.content_stack, 1)
+
+        self.normal_stack = QWidget()
+        self.normal_layout = QVBoxLayout(self.normal_stack)
+        self.normal_layout.setContentsMargins(0, 0, 0, 0)
+        self.normal_layout.setSpacing(0)
+
+        self.page_stack = QStackedWidget()
+        self.normal_layout.addWidget(self.page_stack, 1)
+
+        self.content_stack.addWidget(self.normal_stack)
+        self.content_stack.setCurrentWidget(self.normal_stack)
+
+        # Find bar, initially hidden.
+        self.find_bar = QWidget()
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(3, 3, 3, 3)
+
+        find_layout.addWidget(QLabel("Find:"))
+
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Find on this page")
+        self.find_input.returnPressed.connect(self.find_next)
+        find_layout.addWidget(self.find_input, 1)
+
+        self.find_status = QLabel("")
+        find_layout.addWidget(self.find_status)
+
+        find_next_button = QPushButton("Next")
+        find_next_button.clicked.connect(self.find_next)
+        find_layout.addWidget(find_next_button)
+
+        find_prev_button = QPushButton("Previous")
+        find_prev_button.clicked.connect(self.find_previous)
+        find_layout.addWidget(find_prev_button)
+
+        close_find_button = QToolButton()
+        close_find_button.setText("×")
+        close_find_button.clicked.connect(self.hide_find_bar)
+        find_layout.addWidget(close_find_button)
+
+        self.find_bar.hide()
+        main_layout.addWidget(self.find_bar)
+
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("VORTEX")
+
+        # Track which page currently has keyboard focus.
+        self.active_view = None
+
+    def _tool_button(self, text, tooltip):
+        button = QToolButton()
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setAutoRaise(False)
+        button.setFixedHeight(32)
+        return button
+
+    # --------------------------------------------------------
+    # SHORTCUTS
+    # --------------------------------------------------------
+
+    def _shortcut(self, key, callback):
+        shortcut = QShortcut(QKeySequence(key), self)
+        shortcut.activated.connect(callback)
+
+    def _setup_shortcuts(self):
+        self._shortcut("Ctrl+T", self.new_tab)
+        self._shortcut("Ctrl+W", self.close_current_tab)
+        self._shortcut("Ctrl+L", self.focus_address)
+        self._shortcut("Alt+D", self.focus_address)
+        self._shortcut("Ctrl+R", self.reload_page)
+        self._shortcut("F5", self.reload_page)
+        self._shortcut("Alt+Left", self.go_back)
+        self._shortcut("Alt+Right", self.go_forward)
+        self._shortcut("Ctrl+F", self.show_find_bar)
+        self._shortcut("Ctrl+D", self.add_bookmark)
+        self._shortcut("Ctrl+J", self.show_downloads)
+        self._shortcut("Ctrl+Shift+N", self.open_incognito)
+        self._shortcut("Ctrl+Plus", self.zoom_in)
+        self._shortcut("Ctrl+=", self.zoom_in)
+        self._shortcut("Ctrl+-", self.zoom_out)
+        self._shortcut("Ctrl+0", self.reset_zoom)
+        self._shortcut("Ctrl+Shift+S", self.choose_split_tabs)
+        self._shortcut("Ctrl+Tab", self.next_tab)
+        self._shortcut("Ctrl+Shift+Tab", self.previous_tab)
+
+    # --------------------------------------------------------
+    # WEB VIEWS
+    # --------------------------------------------------------
+
+    def _configure_page(self, view):
+        view.setPage(VortexPage(self.profile, self, view))
+
+        settings = view.settings()
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptEnabled, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalStorageEnabled, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.ErrorPageEnabled, True
+        )
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.PluginsEnabled, True
+        )
+
+        view.urlChanged.connect(
+            lambda url, v=view: self._url_changed(v, url)
+        )
+        view.titleChanged.connect(
+            lambda title, v=view: self._title_changed(v, title)
+        )
+        view.loadProgress.connect(
+            lambda progress, v=view: self._load_progress(v, progress)
+        )
+        view.loadStarted.connect(
+            lambda v=view: self._load_started(v)
+        )
+        view.loadFinished.connect(
+            lambda ok, v=view: self._load_finished(v, ok)
+        )
+
+        view.setZoomFactor(
+            self.settings_data.get("zoom", 100) / 100.0
+        )
+
+        return view
+
+    def create_view(self):
+        view = QWebEngineView()
+        self._configure_page(view)
+
+        self.views.append(view)
+        self.view_titles[view] = "New Tab"
+        self.view_urls[view] = ""
+        self.zoom_levels[view] = self.settings_data.get("zoom", 100)
+
+        view.installEventFilter(self)
+        view.focusInEvent = self._make_focus_handler(view, view.focusInEvent)
+
+        return view
+
+    def _make_focus_handler(self, view, original_handler):
+        def handler(event):
+            self.active_view = view
+            original_handler(event)
+            self._update_navigation_buttons()
+        return handler
+
+    def eventFilter(self, obj, event):
+        if event.type() == event.Type.MouseButtonPress:
+            if obj in self.views:
+                self.active_view = obj
+        return super().eventFilter(obj, event)
+
+    # --------------------------------------------------------
+    # NEW TABS AND POPUPS
+    # --------------------------------------------------------
+
+    def new_tab(self, checked=False, url=None, switch=True):
+        view = self.create_view()
+        index = self.tab_bar.addTab("New Tab")
+
+        self.page_stack.addWidget(view)
+
+        if switch:
+            self.tab_bar.setCurrentIndex(index)
+            self.switch_tab(index)
+
+        if url:
+            self.load_url_in_view(view, url)
+        else:
+            self.show_home(view)
+
+        return view
+
+    def create_popup_page(self, window_type):
+        """
+        Called by QWebEngine when a page uses target=_blank,
+        window.open(), or a similar new-window navigation.
+
+        Return a page belonging to a new VORTEX tab so that
+        the website's requested navigation can continue.
+        """
+        view = self.new_tab(switch=True)
+
+        if view is None:
+            return None
+
+        page = view.page()
+        self.active_view = view
+
+        return page
+
+    def _on_tab_moved(self, from_index, to_index):
+        # Keep page_stack in the same order as the tab bar.
+        if from_index == to_index:
+            return
+
+        widget = self.page_stack.widget(from_index)
+        if widget is None:
+            return
+
+        self.page_stack.removeWidget(widget)
+        self.page_stack.insertWidget(to_index, widget)
+
+        # Rebuild our view list to match the visual tab order.
+        self.views = [
+            self.page_stack.widget(i)
+            for i in range(self.page_stack.count())
+        ]
+
+        self.switch_tab(self.tab_bar.currentIndex())
+
+    def switch_tab(self, index):
+        if index < 0 or index >= len(self.views):
+            return
+
+        view = self.views[index]
+        self.active_view = view
+
+        if self.page_stack.indexOf(view) >= 0:
+            self.page_stack.setCurrentWidget(view)
+
+        if not self.split_active:
+            self.content_stack.setCurrentWidget(self.normal_stack)
+
+        self.address_bar.setText(view.url().toString())
+        self._update_navigation_buttons()
+
+    def close_tab(self, index):
+        if not 0 <= index < len(self.views):
+            return
+
+        view = self.views[index]
+
+        if self.split_active and (
+            view is self.split_left_view or
+            view is self.split_right_view
+        ):
+            self.exit_split_view()
+
+        self.views.remove(view)
+        self.view_titles.pop(view, None)
+        self.view_urls.pop(view, None)
+        self.zoom_levels.pop(view, None)
+
+        self.page_stack.removeWidget(view)
+        self.tab_bar.removeTab(index)
+        view.deleteLater()
+
+        if not self.views:
+            self.new_tab()
+            return
+
+        new_index = min(index, len(self.views) - 1)
+        self.tab_bar.setCurrentIndex(new_index)
+        self.switch_tab(new_index)
+
+    def close_current_tab(self):
+        self.close_tab(self.tab_bar.currentIndex())
+
+    def next_tab(self):
+        if self.views:
+            index = (self.tab_bar.currentIndex() + 1) % len(self.views)
+            self.tab_bar.setCurrentIndex(index)
+
+    def previous_tab(self):
+        if self.views:
+            index = (self.tab_bar.currentIndex() - 1) % len(self.views)
+            self.tab_bar.setCurrentIndex(index)
+
+    # --------------------------------------------------------
+    # NAVIGATION
+    # --------------------------------------------------------
+
+    def current_view(self):
+        if self.active_view in self.views:
+            return self.active_view
+
+        index = self.tab_bar.currentIndex()
+
+        if 0 <= index < len(self.views):
+            return self.views[index]
+
+        return None
+
+    def navigate(self):
+        view = self.current_view()
+
+        if not view:
+            return
+
+        url = normalize_url(
+            self.address_bar.text(),
+            self.settings_data.get("search_engine", "Google"),
+        )
+
+        self.load_url_in_view(view, url)
+
+    def load_url_in_view(self, view, url):
+        if isinstance(url, str):
+            url = QUrl(url)
+
+        if url.toString() == "vortex://home":
+            self.show_home(view)
+            return
+
+        view.setUrl(url)
+
+    def show_home(self, view=None):
+        if view is None:
+            view = self.current_view()
+
+        if not view:
+            return
+
+        home_type = self.settings_data.get("home_page", "vortex")
+
+        if home_type == "custom":
+            view.setUrl(QUrl(self.settings_data.get(
+                "custom_home", "https://www.google.com"
+            )))
+        else:
+            view.setHtml(
+                home_html(self.settings_data.get("theme", "dark")),
+                QUrl("https://vortex.home/")
+            )
+
+    def go_home(self):
+        self.show_home(self.current_view())
+
+    def go_back(self):
+        view = self.current_view()
+        if view:
+            view.back()
+
+    def go_forward(self):
+        view = self.current_view()
+        if view:
+            view.forward()
+
+    def reload_page(self):
+        view = self.current_view()
+        if view:
+            view.reload()
+
+    def focus_address(self):
+        self.address_bar.setFocus()
+        self.address_bar.selectAll()
+
+    def _url_changed(self, view, url):
+        self.view_urls[view] = url.toString()
+
+        if view is self.current_view() and not self.split_active:
+            self.address_bar.setText(url.toString())
+
+        self._update_navigation_buttons()
+
+    def _title_changed(self, view, title):
+        title = title.strip() or "New Tab"
+        self.view_titles[view] = title
+
+        index = self.page_stack.indexOf(view)
+
+        if index >= 0:
+            self.tab_bar.setTabText(index, title[:24])
+            self.tab_bar.setTabToolTip(index, title)
+
+        if view is self.current_view():
+            self.setWindowTitle(f"{title} — VORTEX")
+
+    def _load_started(self, view):
+        if view is self.current_view():
+            self.progress_bar.setValue(0)
+            self.progress_bar.show()
+
+    def _load_progress(self, view, progress):
+        if view is self.current_view():
+            self.progress_bar.setValue(progress)
+
+    def _load_finished(self, view, success):
+        if view is self.current_view():
+            self.progress_bar.hide()
+
+        if success and not self.incognito:
+            url = view.url().toString()
+            title = view.title() or url
+
+            if url and not url.startswith(("about:", "data:")):
+                self.history.append({
+                    "title": title,
+                    "url": url,
+                    "time": int(time.time()),
+                })
+                self.history = self.history[-3000:]
+                save_json(HISTORY_FILE, self.history)
+
+        self._update_navigation_buttons()
+
+    def _update_navigation_buttons(self):
+        view = self.current_view()
+
+        if not view:
+            return
+
+        self.back_button.setEnabled(view.history().canGoBack())
+        self.forward_button.setEnabled(view.history().canGoForward())
+
+    # --------------------------------------------------------
+    # BOOKMARKS
+    # --------------------------------------------------------
+
+    def add_bookmark(self):
+        view = self.current_view()
+
+        if not view:
+            return
+
+        url = view.url().toString()
+
+        if not url or url == "about:blank":
+            return
+
+        title = view.title() or url
+
+        for bookmark in self.bookmarks:
+            if bookmark.get("url") == url:
+                QMessageBox.information(
+                    self, "VORTEX", "This page is already bookmarked."
+                )
+                return
+
+        self.bookmarks.append({"title": title, "url": url})
+
+        if not self.incognito:
+            save_json(BOOKMARKS_FILE, self.bookmarks)
+
+        self.bookmark_button.setText("★")
+        self.statusBar().showMessage("Bookmark added", 2000)
+
+    def show_bookmarks(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Bookmarks")
+        dialog.resize(600, 400)
+
+        layout = QVBoxLayout(dialog)
+        listing = QListWidget()
+
+        for item in self.bookmarks:
+            listing.addItem(
+                f"{item.get('title', 'Untitled')} — {item.get('url', '')}"
+            )
+
+        layout.addWidget(listing)
+
+        row = QHBoxLayout()
+        open_button = QPushButton("Open")
+        delete_button = QPushButton("Delete")
+        close_button = QPushButton("Close")
+
+        row.addWidget(open_button)
+        row.addWidget(delete_button)
+        row.addStretch()
+        row.addWidget(close_button)
+        layout.addLayout(row)
+
+        def open_selected():
+            index = listing.currentRow()
+            if 0 <= index < len(self.bookmarks):
+                self.new_tab(url=self.bookmarks[index]["url"])
+                dialog.accept()
+
+        def delete_selected():
+            index = listing.currentRow()
+            if 0 <= index < len(self.bookmarks):
+                del self.bookmarks[index]
+                listing.takeItem(index)
+                if not self.incognito:
+                    save_json(BOOKMARKS_FILE, self.bookmarks)
+
+        open_button.clicked.connect(open_selected)
+        delete_button.clicked.connect(delete_selected)
+        close_button.clicked.connect(dialog.accept)
+        listing.itemDoubleClicked.connect(lambda _: open_selected())
+
+        dialog.exec()
+
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
+
+    def show_history(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Browsing History")
+        dialog.resize(750, 450)
+
+        layout = QVBoxLayout(dialog)
+        search = QLineEdit()
+        search.setPlaceholderText("Search history...")
+        listing = QListWidget()
+
+        layout.addWidget(search)
+        layout.addWidget(listing)
+
+        def refresh():
+            listing.clear()
+            query = search.text().lower()
+
+            for entry in reversed(self.history):
+                title = entry.get("title", "")
+                url = entry.get("url", "")
+
+                if query and query not in title.lower() and query not in url.lower():
+                    continue
+
+                listing.addItem(f"{title} — {url}")
+
+        search.textChanged.connect(refresh)
+        refresh()
+
+        row = QHBoxLayout()
+        open_button = QPushButton("Open")
+        clear_button = QPushButton("Clear History")
+        close_button = QPushButton("Close")
+
+        row.addWidget(open_button)
+        row.addWidget(clear_button)
+        row.addStretch()
+        row.addWidget(close_button)
+        layout.addLayout(row)
+
+        def open_selected():
+            index = listing.currentRow()
+            entries = [
+                e for e in reversed(self.history)
+                if not search.text().lower()
+                or search.text().lower() in e.get("title", "").lower()
+                or search.text().lower() in e.get("url", "").lower()
+            ]
+
+            if 0 <= index < len(entries):
+                self.new_tab(url=entries[index]["url"])
+                dialog.accept()
+
+        def clear_history():
+            answer = QMessageBox.question(
+                dialog,
+                "Clear history",
+                "Clear all browsing history?",
+            )
+
+            if answer == QMessageBox.StandardButton.Yes:
+                self.history.clear()
+                if not self.incognito:
+                    save_json(HISTORY_FILE, self.history)
+                refresh()
+
+        open_button.clicked.connect(open_selected)
+        clear_button.clicked.connect(clear_history)
+        close_button.clicked.connect(dialog.accept)
+        listing.itemDoubleClicked.connect(lambda _: open_selected())
+
+        dialog.exec()
+
+    # --------------------------------------------------------
+    # DOWNLOADS
+    # --------------------------------------------------------
+
+    def handle_download(self, download):
+        suggested = download.suggestedFileName() or "download"
+
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Download",
+            os.path.join(DOWNLOAD_DIR, suggested),
+        )
+
+        if not destination:
+            download.cancel()
+            return
+
+        directory = os.path.dirname(destination)
+        filename = os.path.basename(destination)
+
+        download.setDownloadDirectory(directory)
+        download.setDownloadFileName(filename)
+
+        download.downloadProgress.connect(
+            lambda received, total, d=download:
+                self.statusBar().showMessage(
+                    f"Downloading {d.downloadFileName()}: "
+                    f"{received / total * 100:.0f}%"
+                    if total > 0 else
+                    f"Downloading {d.downloadFileName()}",
+                    3000,
+                )
+        )
+
+        download.stateChanged.connect(
+            lambda state, d=download:
+                self._download_state_changed(d, state)
+        )
+
+        download.accept()
+
+    def _download_state_changed(self, download, state):
+        if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
+            self.statusBar().showMessage(
+                f"Download complete: {download.downloadFileName()}",
+                5000,
+            )
+        elif state == QWebEngineDownloadRequest.DownloadState.DownloadCancelled:
+            self.statusBar().showMessage("Download cancelled", 3000)
+        elif state == QWebEngineDownloadRequest.DownloadState.DownloadInterrupted:
+            self.statusBar().showMessage("Download interrupted", 5000)
+
+    def show_downloads(self):
+        try:
+            os.startfile(DOWNLOAD_DIR)
+        except AttributeError:
+            import subprocess
+            import platform
+
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", DOWNLOAD_DIR])
+            else:
+                subprocess.Popen(["xdg-open", DOWNLOAD_DIR])
+        except OSError as error:
+            QMessageBox.warning(self, "Downloads", str(error))
+
+    # --------------------------------------------------------
+    # FIND IN PAGE
+    # --------------------------------------------------------
+
+    def show_find_bar(self):
+        self.find_bar.show()
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+    def hide_find_bar(self):
+        self.find_bar.hide()
+        view = self.current_view()
+        if view:
+            view.setFocus()
+
+    def find_next(self):
+        view = self.current_view()
+        if not view:
+            return
+
+        text = self.find_input.text()
+        if not text:
+            self.find_status.setText("")
+            return
+
+        view.findText(
+            text,
+            QWebEnginePage.FindFlag(0),
+            self._find_result,
+        )
+
+    def find_previous(self):
+        view = self.current_view()
+        if not view:
+            return
+
+        text = self.find_input.text()
+        if not text:
+            return
+
+        view.findText(
+            text,
+            QWebEnginePage.FindFlag.FindBackward,
+            self._find_result,
+        )
+
+    def _find_result(self, result):
+        self.find_status.setText(
+            "Found" if result.numberOfMatches() else "No matches"
+        )
+
+    # --------------------------------------------------------
+    # ZOOM
+    # --------------------------------------------------------
+
+    def zoom_in(self):
+        self.change_zoom(10)
+
+    def zoom_out(self):
+        self.change_zoom(-10)
+
+    def reset_zoom(self):
+        view = self.current_view()
+        if view:
+            view.setZoomFactor(1.0)
+            self.zoom_levels[view] = 100
+
+    def change_zoom(self, amount):
+        view = self.current_view()
+        if not view:
+            return
+
+        current = round(view.zoomFactor() * 100)
+        value = max(30, min(250, current + amount))
+
+        view.setZoomFactor(value / 100.0)
+        self.zoom_levels[view] = value
+
+        self.statusBar().showMessage(f"Zoom: {value}%", 1500)
+
+    # --------------------------------------------------------
+    # NOTES
+    # --------------------------------------------------------
+
+    def show_notes(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("VORTEX Quick Notes")
+        dialog.resize(600, 450)
+
+        layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit()
+        editor.setPlaceholderText("Write your notes here...")
+        editor.setPlainText(
+            open(NOTES_FILE, "r", encoding="utf-8").read()
+            if os.path.exists(NOTES_FILE) else ""
+        )
+        layout.addWidget(editor)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(buttons)
+
+        def save_notes():
+            try:
+                with open(NOTES_FILE, "w", encoding="utf-8") as f:
+                    f.write(editor.toPlainText())
+                dialog.accept()
+            except OSError as error:
+                QMessageBox.warning(dialog, "Notes", str(error))
+
+        buttons.accepted.connect(save_notes)
+        buttons.rejected.connect(dialog.reject)
+
+        dialog.exec()
+
+    # --------------------------------------------------------
+    # SPLIT VIEW: CHOOSE ANY TWO TABS
+    # --------------------------------------------------------
+
+    def choose_split_tabs(self):
+        if len(self.views) < 2:
+            QMessageBox.information(
+                self,
+                "Split View",
+                "Open at least two tabs before using split view.",
+            )
+            return
+
+        tab_data = []
+
+        for index, view in enumerate(self.views):
+            title = self.view_titles.get(view, "New Tab")
+            url = view.url().toString()
+            tab_data.append((index, title, url))
+
+        dialog = SplitViewDialog(
+            tab_data,
+            self.tab_bar.currentIndex(),
+            self,
+        )
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        left_index, right_index = dialog.selected_indices()
+
+        if left_index == right_index:
+            QMessageBox.warning(
+                self,
+                "Split View",
+                "Choose two different tabs.",
+            )
+            return
+
+        left_view = self.views[left_index]
+        right_view = self.views[right_index]
+
+        self.enter_split_view(left_view, right_view)
+
+    def enter_split_view(self, left_view, right_view):
+        self.exit_split_view(rebuild=False)
+
+        self.split_active = True
+        self.split_left_view = left_view
+        self.split_right_view = right_view
+
+        # Move the actual existing browser widgets into the splitter.
+        # The pages are not reloaded, so their state is preserved.
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(5)
+
+        self.page_stack.removeWidget(left_view)
+        self.page_stack.removeWidget(right_view)
+
+        self.splitter.addWidget(left_view)
+        self.splitter.addWidget(right_view)
+        self.splitter.setSizes([1, 1])
+
+        self.content_stack.addWidget(self.splitter)
+        self.content_stack.setCurrentWidget(self.splitter)
+
+        self.active_view = left_view
+        self.address_bar.setText(left_view.url().toString())
+
+        self.statusBar().showMessage(
+            "Split View — choose another pair from the menu anytime"
+        )
+
+    def exit_split_view(self, rebuild=True):
+        if not self.split_active:
+            return
+
+        left_view = self.split_left_view
+        right_view = self.split_right_view
+        splitter = self.splitter
+
+        self.split_active = False
+        self.split_left_view = None
+        self.split_right_view = None
+        self.splitter = None
+
+        if splitter:
+            splitter.removeWidget(left_view)
+            splitter.removeWidget(right_view)
+            self.content_stack.removeWidget(splitter)
+            splitter.deleteLater()
+
+        if left_view in self.views and self.page_stack.indexOf(left_view) < 0:
+            self.page_stack.addWidget(left_view)
+
+        if right_view in self.views and self.page_stack.indexOf(right_view) < 0:
+            self.page_stack.addWidget(right_view)
+
+        # Rebuild stack order from the visible tab-bar order.
+        for view in self.views:
+            if self.page_stack.indexOf(view) < 0:
+                self.page_stack.addWidget(view)
+
+        if rebuild:
+            index = self.tab_bar.currentIndex()
+            if 0 <= index < len(self.views):
+                self.switch_tab(index)
+            else:
+                self.content_stack.setCurrentWidget(self.normal_stack)
+
+    # --------------------------------------------------------
+    # INCOGNITO
+    # --------------------------------------------------------
+
+    def open_incognito(self):
+        self.incognito_window = VortexBrowser(incognito=True)
+        self.incognito_window.show()
+
+    # --------------------------------------------------------
+    # THEME
+    # --------------------------------------------------------
+
+    def apply_theme(self):
+        theme = self.settings_data.get("theme", "dark")
+        QApplication.instance().setStyleSheet(
+            DARK_STYLE if theme == "dark" else LIGHT_STYLE
+        )
+
+    def toggle_theme(self):
+        current = self.settings_data.get("theme", "dark")
+        self.settings_data["theme"] = (
+            "light" if current == "dark" else "dark"
+        )
+
+        if not self.incognito:
+            save_json(SETTINGS_FILE, self.settings_data)
+
+        self.apply_theme()
+
+        for view in self.views:
+            if view.url().toString().startswith("https://vortex.home/"):
+                self.show_home(view)
+
+    # --------------------------------------------------------
+    # SETTINGS
+    # --------------------------------------------------------
+
+    def show_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("VORTEX Settings")
+        dialog.resize(420, 320)
+
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        theme = QComboBox()
+        theme.addItems(["dark", "light"])
+        theme.setCurrentText(self.settings_data.get("theme", "dark"))
+
+        search = QComboBox()
+        search.addItems(["Google", "Bing", "DuckDuckGo", "Brave"])
+        search.setCurrentText(
+            self.settings_data.get("search_engine", "Google")
+        )
+
+        home = QComboBox()
+        home.addItems(["vortex", "custom"])
+        home.setCurrentText(
+            self.settings_data.get("home_page", "vortex")
+        )
+
+        custom_home = QLineEdit(
+            self.settings_data.get(
+                "custom_home", "https://www.google.com"
+            )
+        )
+
+        restore = QCheckBox("Restore tabs when VORTEX starts")
+        restore.setChecked(
+            self.settings_data.get("restore_session", True)
+        )
+
+        form.addRow("Theme:", theme)
+        form.addRow("Search engine:", search)
+        form.addRow("Home page:", home)
+        form.addRow("Custom home URL:", custom_home)
+        form.addRow("", restore)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(buttons)
+
+        def save_settings():
+            self.settings_data["theme"] = theme.currentText()
+            self.settings_data["search_engine"] = search.currentText()
+            self.settings_data["home_page"] = home.currentText()
+            self.settings_data["custom_home"] = custom_home.text().strip()
+            self.settings_data["restore_session"] = restore.isChecked()
+
+            if not self.incognito:
+                save_json(SETTINGS_FILE, self.settings_data)
+
+            self.apply_theme()
+            dialog.accept()
+
+        buttons.accepted.connect(save_settings)
+        buttons.rejected.connect(dialog.reject)
+
+        dialog.exec()
+
+    # --------------------------------------------------------
+    # THREE-DOT MENU
+    # --------------------------------------------------------
+
+    def show_browser_menu(self):
+        menu = QMenu(self)
+
+        split_action = menu.addAction("Choose Split View Tabs")
+        exit_split_action = menu.addAction("Exit Split View")
+        menu.addSeparator()
+
+        bookmarks_action = menu.addAction("Bookmarks")
+        history_action = menu.addAction("History")
+        downloads_action = menu.addAction("Downloads")
+        notes_action = menu.addAction("Quick Notes")
+
+        menu.addSeparator()
+
+        zoom_menu = menu.addMenu("Zoom")
+        zoom_in_action = zoom_menu.addAction("Zoom In")
+        zoom_out_action = zoom_menu.addAction("Zoom Out")
+        zoom_reset_action = zoom_menu.addAction("Reset Zoom")
+
+        menu.addSeparator()
+
+        theme_action = menu.addAction("Toggle Dark/Light Theme")
+        settings_action = menu.addAction("Settings")
+        incognito_action = menu.addAction("New Incognito Window")
+        clear_action = menu.addAction("Clear Browsing Data")
+        about_action = menu.addAction("About VORTEX")
+
+        exit_split_action.setEnabled(self.split_active)
+
+        selected = menu.exec(
+            self.menu_button.mapToGlobal(
+                self.menu_button.rect().bottomLeft()
+            )
+        )
+
+        if selected == split_action:
+            self.choose_split_tabs()
+        elif selected == exit_split_action:
+            self.exit_split_view()
+        elif selected == bookmarks_action:
+            self.show_bookmarks()
+        elif selected == history_action:
+            self.show_history()
+        elif selected == downloads_action:
+            self.show_downloads()
+        elif selected == notes_action:
+            self.show_notes()
+        elif selected == zoom_in_action:
+            self.zoom_in()
+        elif selected == zoom_out_action:
+            self.zoom_out()
+        elif selected == zoom_reset_action:
+            self.reset_zoom()
+        elif selected == theme_action:
+            self.toggle_theme()
+        elif selected == settings_action:
+            self.show_settings()
+        elif selected == incognito_action:
+            self.open_incognito()
+        elif selected == clear_action:
+            self.clear_browsing_data()
+        elif selected == about_action:
+            QMessageBox.about(
+                self,
+                "About VORTEX",
+                "VORTEX Browser\n\n"
+                "A custom desktop browser built with Python and Qt WebEngine.",
+            )
+
+    # --------------------------------------------------------
+    # CLEAR BROWSING DATA
+    # --------------------------------------------------------
+
+    def clear_browsing_data(self):
+        answer = QMessageBox.question(
+            self,
+            "Clear Browsing Data",
+            "Clear browsing history and the browser cache?",
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.history.clear()
+
+        if not self.incognito:
+            save_json(HISTORY_FILE, self.history)
+
+        self.profile.clearHttpCache()
+        self.profile.cookieStore().deleteAllCookies()
+
+        self.statusBar().showMessage(
+            "Browsing history, cache and cookies cleared", 4000
+        )
+
+    # --------------------------------------------------------
+    # SESSION RESTORATION
+    # --------------------------------------------------------
+
+    def save_session(self):
+        if self.incognito:
+            return
+
+        urls = [
+            view.url().toString()
+            for view in self.views
+        ]
+
+        save_json(SESSION_FILE, {
+            "tabs": urls,
+            "current": max(0, self.tab_bar.currentIndex()),
+        })
+
+    # --------------------------------------------------------
+    # WINDOW CLOSE
+    # --------------------------------------------------------
+
+    def closeEvent(self, event):
+        self.save_session()
+
+        if self.split_active:
+            self.exit_split_view()
+
+        event.accept()
+
+
+# ============================================================
+# START APPLICATION
+# ============================================================
+
+def main():
+    QApplication.setApplicationName("VORTEX")
+    QApplication.setOrganizationName("VORTEX")
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    browser = VortexBrowser()
+    browser.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
